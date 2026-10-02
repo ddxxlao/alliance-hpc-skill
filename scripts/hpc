@@ -1,0 +1,157 @@
+#!/usr/bin/env bash
+# hpc — drive Alliance (Digital Research Alliance of Canada) Slurm clusters from this Mac.
+# Every command reuses an SSH ControlMaster socket that the USER opened by running
+# `ssh <cluster>` in a real terminal (Duo MFA). This script never opens a new
+# authenticated connection on its own: a dead socket means "ask the user".
+set -euo pipefail
+
+SKILL_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../config.env
+source "$SKILL_DIR/config.env"
+CLUSTERS="nibi fir rorqual narval trillium-gpu"
+UNUSABLE="killarney vulcan tamia"
+
+# Per-cluster defaults. MODEL_ROOT is where fetch-model puts weights; the variables are
+# expanded on the remote side.
+gpu_default() { case $1 in narval) echo a100:1 ;; trillium-gpu) echo 1 ;; *) echo h100:1 ;; esac; }
+model_root() {
+  case $1 in
+    narval) echo '$SCRATCH/models' ;;            # project file quota is full (500K/500K)
+    *)      echo "/project/$HPC_ACCOUNT/\$USER/models" ;;
+  esac
+}
+
+die() { echo "hpc: $*" >&2; exit 1; }
+
+known() {
+  [ -n "$HPC_USER" ] || die "set HPC_USER in $SKILL_DIR/config.env (your Alliance username)"
+  case " $CLUSTERS " in *" $1 "*) return 0 ;; esac
+  case " $UNUSABLE " in *" $1 "*) die "$1: SSH works but $HPC_ACCOUNT cannot submit jobs there (Invalid account)." ;; esac
+  die "unknown cluster '$1' (usable: $CLUSTERS)"
+}
+
+# Multiplex-only: if the user's ControlMaster socket died, fail immediately instead of letting
+# ssh fall back to a fresh connection (that attempt reaches Duo and is logged as a failed login).
+# ProxyCommand is only used for NEW connections, so pointing it at `false` blocks the fallback.
+MUX="-o BatchMode=yes -o ControlMaster=no -o ProxyCommand=/usr/bin/false"
+
+# Expand a literal $USER / $SCRATCH (as written by the caller) to this user's real paths.
+expand() { local p=${1//\$SCRATCH//scratch/$HPC_USER}; echo "${p//\$USER/$HPC_USER}"; }
+
+alive() { ssh -O check "$1" >/dev/null 2>&1; }
+
+need() {
+  known "$1"
+  alive "$1" && return 0
+  cat >&2 <<EOF
+hpc: no live SSH session for '$1'.
+  Ask the user to run this in a real terminal (Terminal/iTerm, not a Claude '!' shell):
+      ssh $1
+  and approve the Duo push; the session is then reused for 8h.
+  Do NOT retry the connection yourself: failed attempts are logged on the cluster.
+EOF
+  exit 3
+}
+
+# Run a command string on the cluster in a login shell (so `module` works).
+rsh() { local c=$1; shift; ssh -T $MUX "$c" 'bash -l -s' <<<"$*"; }
+
+usage() {
+  cat <<EOF
+usage: hpc <command> [args]
+
+  check [cluster...]                  which sessions are alive (default: all usable clusters)
+  run <cluster> '<shell cmd>'         run a command on the login node (login shell, modules available)
+  put <cluster> <local> <remote>      rsync local -> cluster (remote path may use ~ or a quoted '\$SCRATCH/...')
+  get <cluster> <remote> <local>      rsync cluster -> local
+  setup-env <cluster> [--status]      build ~/venvs/sglang (torch + sglang) in the background on the login node
+  fetch-model <cluster> <hf_repo> [--status]
+                                      download HF weights on the login node into the model root
+  model-path <cluster> <hf_repo>      print where fetch-model stores that repo
+  submit <cluster> <file.sbatch> [sbatch options...]
+                                      copy to \$SCRATCH/jobs on the cluster and sbatch it there
+                                      (adds --account=\$HPC_ACCOUNT and the default --gpus-per-node)
+  status <cluster> <jobid>            squeue reason / sacct state
+  log <cluster> <jobid> [lines]       tail the job's output file
+  cancel <cluster> <jobid>            scancel
+
+usable clusters: $CLUSTERS
+EOF
+}
+
+cmd=${1:-help}; shift || true
+case $cmd in
+  check)
+    for c in ${*:-$CLUSTERS}; do
+      if alive "$c"; then printf '%-13s alive\n' "$c"; else printf '%-13s DEAD  (user must run: ssh %s)\n' "$c" "$c"; fi
+    done ;;
+
+  run)
+    [ $# -ge 2 ] || die "usage: hpc run <cluster> '<cmd>'"
+    c=$1; shift; need "$c"; rsh "$c" "$*" ;;
+
+  put)
+    [ $# -eq 3 ] || die "usage: hpc put <cluster> <local> <remote>"
+    need "$1"; rsync -a -e "ssh $MUX" "$2" "$1:$(expand "$3")" ;;
+
+  get)
+    [ $# -eq 3 ] || die "usage: hpc get <cluster> <remote> <local>"
+    need "$1"; rsync -a -e "ssh $MUX" "$1:$(expand "$2")" "$3" ;;
+
+  setup-env)
+    [ $# -ge 1 ] || die "usage: hpc setup-env <cluster> [--status]"
+    c=$1; need "$c"
+    if [ "${2:-}" = --status ]; then
+      rsh "$c" 'if grep -q INSTALL_DONE ~/venvs/sglang-install.log 2>/dev/null; then echo "state: DONE"; grep -E "^torch " ~/venvs/sglang-install.log;
+        elif pgrep -u $USER -x -f "/bin/bash $HOME/venvs/install-sglang.sh" >/dev/null || pgrep -u $USER -f "venvs/sglang/bin/pip" >/dev/null; then echo "state: RUNNING"; tail -c 300 ~/venvs/sglang-install.log; echo;
+        else echo "state: FAILED or never started"; tail -n 15 ~/venvs/sglang-install.log 2>/dev/null; fi'
+      exit 0
+    fi
+    rsh "$c" 'if pgrep -u $USER -f "venvs/sglang/bin/pip" >/dev/null; then echo "an install is already running; use --status"; exit 4; fi; mkdir -p ~/venvs'
+    ssh -T $MUX "$c" 'cat > ~/venvs/sglang-modules.sh' < "$SKILL_DIR/scripts/remote/sglang-modules.sh"
+    ssh -T $MUX "$c" 'cat > ~/venvs/sglang-job-env.sh' < "$SKILL_DIR/scripts/remote/sglang-job-env.sh"
+    ssh -T $MUX "$c" 'cat > ~/venvs/install-sglang.sh && chmod +x ~/venvs/install-sglang.sh' < "$SKILL_DIR/scripts/remote/install-sglang.sh"
+    rsh "$c" 'nohup ~/venvs/install-sglang.sh > ~/venvs/sglang-install.log 2>&1 < /dev/null & echo "started install (pid $!); log: ~/venvs/sglang-install.log"' ;;
+
+  model-path)
+    [ $# -eq 2 ] || die "usage: hpc model-path <cluster> <hf_repo>"
+    known "$1"; r=$(model_root "$1"); r=$(expand "$r"); echo "$r/$2" ;;
+
+  fetch-model)
+    [ $# -ge 2 ] || die "usage: hpc fetch-model <cluster> <hf_repo> [--status]"
+    c=$1; repo=$2; need "$c"; root=$(model_root "$c"); tag=$(echo "$repo" | tr '/' '_')
+    if [ "${3:-}" = --status ]; then
+      rsh "$c" "pgrep -u \$USER -f 'fetch-$tag' >/dev/null && echo 'state: RUNNING' || echo 'state: not running'; tail -n 3 $root/.logs/fetch-$tag.log 2>/dev/null; du -sh $root/$repo 2>/dev/null"
+      exit 0
+    fi
+    rsh "$c" "set -e; mkdir -p $root/.logs $root/$repo
+      [ -f ~/venvs/sglang/bin/hf ] || { echo 'no ~/venvs/sglang yet: run hpc setup-env first'; exit 4; }
+      nohup bash -c 'exec -a fetch-$tag ~/venvs/sglang/bin/hf download $repo --local-dir $root/$repo' > $root/.logs/fetch-$tag.log 2>&1 < /dev/null &
+      echo \"downloading $repo -> $root/$repo (log: $root/.logs/fetch-$tag.log)\"" ;;
+
+  submit)
+    [ $# -ge 2 ] || die "usage: hpc submit <cluster> <file.sbatch> [sbatch options...]"
+    c=$1; f=$2; shift 2; need "$c"; [ -f "$f" ] || die "no such file: $f"
+    extra="--account=$HPC_ACCOUNT"
+    case " $* " in *" --gpus-per-node"*|*" --gres"*) ;; *) extra="$extra --gpus-per-node=$(gpu_default "$c")" ;; esac
+    name=$(basename "$f")
+    ssh -T $MUX "$c" "mkdir -p \$SCRATCH/jobs && cat > \$SCRATCH/jobs/$name" < "$f"
+    rsh "$c" "cd \$SCRATCH/jobs && sbatch --parsable $extra $* $name" ;;
+
+  status)
+    [ $# -eq 2 ] || die "usage: hpc status <cluster> <jobid>"
+    need "$1"
+    rsh "$1" "squeue -h -j $2 -o 'queue: %T reason=%R elapsed=%M limit=%l node=%N' 2>/dev/null; sacct -X -n -j $2 --format=JobName%20,State%12,ExitCode,Elapsed,AllocTRES%60" ;;
+
+  log)
+    [ $# -ge 2 ] || die "usage: hpc log <cluster> <jobid> [lines]"
+    need "$1"
+    rsh "$1" "f=\$(ls \$SCRATCH/jobs/*-$2.out \$SCRATCH/jobs/slurm-$2.out 2>/dev/null | head -1); [ -n \"\$f\" ] || { echo 'no output file yet (job pending?)'; exit 0; }; echo \"== \$f\"; tail -n ${3:-60} \"\$f\"" ;;
+
+  cancel)
+    [ $# -eq 2 ] || die "usage: hpc cancel <cluster> <jobid>"
+    need "$1"; rsh "$1" "scancel $2 && echo cancelled $2" ;;
+
+  help|-h|--help) usage ;;
+  *) usage; exit 1 ;;
+esac
